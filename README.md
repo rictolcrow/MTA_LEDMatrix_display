@@ -27,6 +27,6 @@ https://snowb.org/
 
 https://fontstruct.com/fontstructions/download/492696
 
-There is a lot of work in the ##gtfs## and ##protobuff## that I used, guided by ChatGPT.
+There is a lot of work in the **gtfs** and **protobuff** that I used, guided by ChatGPT.
 
 Intended to let my goofy son know when he has to leave to get to school on time. 
