@@ -1,0 +1,9 @@
+# Stream decode big repeated fields (from chatgpt)
+transit_realtime.FeedMessage.entity type:FT_CALLBACK
+transit_realtime.TripUpdate.stop_time_update type:FT_CALLBACK
+
+# Keep string sizes reasonable
+transit_realtime.FeedEntity.id max_length:32
+transit_realtime.TripDescriptor.trip_id max_length:64
+transit_realtime.TripDescriptor.route_id max_length:8
+transit_realtime.TripUpdate.StopTimeUpdate.stop_id max_length:16

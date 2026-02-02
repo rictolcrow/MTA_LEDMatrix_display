@@ -1,0 +1,466 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+/*#include <time.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+//#include "esp_heap_caps.h"*/
+
+// nanopb
+extern "C" {
+#include "pb_decode.h"
+#include "gtfs-realtime.pb.h"
+}
+
+// ---------------- USER CONFIG ----------------
+static const char* WIFI_SSID = "";
+static const char* WIFI_PASS = "";
+
+static const char* MTA_API_KEY = "";  // optional
+
+static const char* HOST = "api-endpoint.mta.info";
+static const uint16_t PORT = 443;
+static const char* PATH = "/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-ace";
+
+static const char* TARGET_ROUTE = "A";
+static const char* TARGET_STOP = "A12N";  // 145 St uptown platform
+
+static const uint32_t POLL_MS = 30000;
+
+// Hard cap to prevent runaway allocations in INTERNAL heap
+static const size_t MAX_BODY_BYTES = 180 * 1024;  // 180 KB
+
+// Read chunk size from socket into internal RAM buffer
+static const size_t READ_CHUNK = 2048;
+
+// TLS: easiest path is insecure. For production, use CA/cert pinning.
+static const bool TLS_INSECURE = true;
+// ---------------------------------------------
+
+// ---------- Types ----------
+struct Arrival {
+  uint32_t t;
+  char trip_id[64];
+};
+// -------------------------
+
+static bool streq(const char* a, const char* b) {
+  return (a && b && strcmp(a, b) == 0);
+}
+
+static void printHeapStats(const char* tag) {
+  Serial.printf("[%s] Free heap=%u | Min free heap=%u\n", tag, (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap());
+}
+
+static void syncTime() {
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  Serial.print("Syncing NTP");
+  time_t now = 0;
+  int tries = 0;
+  while (now < 1700000000 && tries < 60) {
+    delay(250);
+    Serial.print(".");
+    time(&now);
+    tries++;
+  }
+  Serial.println();
+  Serial.print("Unix time: ");
+  Serial.println((unsigned long)now);
+}
+
+// Read CRLF line into buf (without CRLF)
+static bool readLine(WiFiClientSecure& c, char* out, size_t outMax, uint32_t timeoutMs) {
+  size_t n = 0;
+  uint32_t start = millis();
+
+  while (millis() - start < timeoutMs) {
+    while (c.available()) {
+      char ch = (char)c.read();
+      if (ch == '\r') {
+        // consume '\n' if present
+        uint32_t t0 = millis();
+        while (!c.available() && millis() - t0 < timeoutMs) delay(1);
+        if (c.available() && (char)c.peek() == '\n') c.read();
+        out[n] = '\0';
+        return true;
+      }
+      if (ch == '\n') {
+        out[n] = '\0';
+        return true;
+      }
+      if (n + 1 < outMax) out[n++] = ch;
+    }
+    if (!c.connected()) break;
+    delay(1);
+  }
+  return false;
+}
+
+static bool startsWithNoCase(const char* s, const char* prefix) {
+  while (*prefix) {
+    char a = *s++;
+    char b = *prefix++;
+    if (a >= 'A' && a <= 'Z') a = a - 'A' + 'a';
+    if (b >= 'A' && b <= 'Z') b = b - 'A' + 'a';
+    if (a != b) return false;
+  }
+  return true;
+}
+
+static bool containsNoCase(const char* s, const char* needle) {
+  for (size_t i = 0; s[i]; i++) {
+    size_t j = 0;
+    while (needle[j]) {
+      char a = s[i + j];
+      if (!a) break;
+      char b = needle[j];
+      if (a >= 'A' && a <= 'Z') a = a - 'A' + 'a';
+      if (b >= 'A' && b <= 'Z') b = b - 'A' + 'a';
+      if (a != b) break;
+      j++;
+    }
+    if (!needle[j]) return true;
+  }
+  return false;
+}
+
+static int cmpArrival(const void* a, const void* b) {
+  const Arrival* A = (const Arrival*)a;
+  const Arrival* B = (const Arrival*)b;
+  if (A->t < B->t) return -1;
+  if (A->t > B->t) return 1;
+  return 0;
+}
+
+static void printArrivals(const Arrival* arr, int n) {
+  time_t now;
+  time(&now);
+
+  Serial.println("\n--- A arrivals @ 145 St uptown (A12N) ---");
+  if (n <= 0) {
+    Serial.println("No matching arrivals found in this snapshot.");
+    return;
+  }
+  for (int i = 0; i < n; i++) {
+    double mins = ((double)arr[i].t - (double)now) / 60.0;
+    Serial.printf("%2d) in %7.2f min | unix=%u | trip_id=%s\n",
+                  i + 1, mins, (unsigned)arr[i].t, arr[i].trip_id);
+  }
+}
+
+// Debug helpers (kept lightweight)
+static void printTaskStats(const char* tag) {
+  UBaseType_t watermark = uxTaskGetStackHighWaterMark(NULL);
+  Serial.printf("[%s] stack high watermark (words)=%u (~%u bytes)\n",
+                tag, (unsigned)watermark, (unsigned)watermark * 4);
+}
+
+static void heapCheck(const char* tag) {
+  bool ok = heap_caps_check_integrity_all(true);
+  Serial.printf("[%s] heap integrity: %s\n", tag, ok ? "OK" : "BROKEN");
+}
+
+/*
+  Raw HTTPS GET. Reads body into INTERNAL HEAP (malloc).
+
+  Returns true with (*out_buf, *out_len) set. Caller frees *out_buf.
+  Expects Content-Length (MTA provides it).
+*/
+static bool httpsGetBodyInternal(uint8_t** out_buf, size_t* out_len) {
+  *out_buf = nullptr;
+  *out_len = 0;
+
+  printTaskStats("pre-client");
+  heapCheck("pre-client");
+
+  WiFiClientSecure client;
+  client.setTimeout(20);  // seconds
+  if (TLS_INSECURE) client.setInsecure();
+
+  Serial.printf("Connecting to %s:%u...\n", HOST, PORT);
+  if (!client.connect(HOST, PORT)) {
+    Serial.println("❌ TLS connect failed");
+    return false;
+  }
+
+  // Send request
+  client.printf("GET %s HTTP/1.1\r\n", PATH);
+  client.printf("Host: %s\r\n", HOST);
+  client.print("User-Agent: esp32-gtfsrt/1.0\r\n");
+  client.print("Accept: application/x-protobuf\r\n");
+  client.print("Connection: keep-alive\r\n");
+  if (MTA_API_KEY && strlen(MTA_API_KEY) > 0) {
+    client.print("x-api-key: ");
+    client.print(MTA_API_KEY);
+    client.print("\r\n");
+  }
+  client.print("\r\n");
+
+  // Status line
+  char line[192];
+  if (!readLine(client, line, sizeof(line), 8000)) {
+    Serial.println("❌ Failed to read status line");
+    client.stop();
+    return false;
+  }
+  Serial.print("Status: ");
+  Serial.println(line);
+  if (!containsNoCase(line, "200")) {
+    Serial.println("❌ Non-200 status");
+    client.stop();
+    return false;
+  }
+
+  // Headers
+  long contentLen = -1;
+  bool chunked = false;
+
+  while (true) {
+    if (!readLine(client, line, sizeof(line), 8000)) {
+      Serial.println("❌ Header read timeout");
+      client.stop();
+      return false;
+    }
+    if (line[0] == '\0') break;
+
+    if (startsWithNoCase(line, "Content-Length:")) {
+      const char* p = line + strlen("Content-Length:");
+      while (*p == ' ' || *p == '\t') p++;
+      contentLen = strtol(p, nullptr, 10);
+    }
+    if (startsWithNoCase(line, "Transfer-Encoding:") && containsNoCase(line, "chunked")) {
+      chunked = true;
+    }
+  }
+
+  Serial.printf("Headers parsed: contentLen=%ld chunked=%s\n", contentLen, chunked ? "yes" : "no");
+
+  printTaskStats("post-headers");
+  heapCheck("post-headers");
+
+  if (chunked) {
+    Serial.println("❌ This version expects Content-Length, but got chunked transfer.");
+    client.stop();
+    return false;
+  }
+  if (contentLen <= 0) {
+    Serial.println("❌ Missing/invalid Content-Length");
+    client.stop();
+    return false;
+  }
+  if ((size_t)contentLen > MAX_BODY_BYTES) {
+    Serial.printf("❌ Body too large for internal heap cap (%u bytes)\n", (unsigned)MAX_BODY_BYTES);
+    client.stop();
+    return false;
+  }
+
+  uint8_t* buf = (uint8_t*)malloc((size_t)contentLen);
+  if (!buf) {
+    Serial.println("❌ malloc failed (internal heap) for body");
+    client.stop();
+    return false;
+  }
+
+  uint8_t* tmp = (uint8_t*)malloc(READ_CHUNK);
+  if (!tmp) {
+    Serial.println("❌ malloc failed for tmp buffer");
+    free(buf);
+    client.stop();
+    return false;
+  }
+
+  printTaskStats("post-malloc");
+  heapCheck("post-malloc");
+
+  size_t got = 0;
+  uint32_t lastPrint = millis();
+
+  const uint32_t OVERALL_TIMEOUT_MS = 60000;
+  const uint32_t IDLE_TIMEOUT_MS = 15000;
+
+  uint32_t startMs = millis();
+  uint32_t lastProgressMs = millis();
+
+  while (got < (size_t)contentLen) {
+    if (millis() - startMs > OVERALL_TIMEOUT_MS) {
+      Serial.printf("❌ overall timeout at got=%u / %ld\n", (unsigned)got, contentLen);
+      free(tmp);
+      free(buf);
+      client.stop();
+      return false;
+    }
+
+    int avail = client.available();
+    if (avail <= 0) {
+      if (millis() - lastProgressMs > IDLE_TIMEOUT_MS) {
+        Serial.printf("❌ idle timeout at got=%u / %ld\n", (unsigned)got, contentLen);
+        heapCheck("idle-timeout");
+        free(tmp);
+        free(buf);
+        client.stop();
+        return false;
+      }
+      delay(10);
+      continue;
+    }
+
+    size_t remaining = (size_t)contentLen - got;
+    size_t want = (size_t)avail;
+    if (want > remaining) want = remaining;
+    if (want > READ_CHUNK) want = READ_CHUNK;
+
+    int r = client.read(tmp, (int)want);
+    if (r > 0) {
+      memcpy(buf + got, tmp, (size_t)r);
+      got += (size_t)r;
+      lastProgressMs = millis();
+    } else {
+      delay(10);
+    }
+
+    if ((got % 8192) == 0 || (millis() - lastPrint) > 2000) {
+      Serial.printf("...downloaded %u / %ld bytes\n", (unsigned)got, contentLen);
+      lastPrint = millis();
+      delay(1);
+    }
+  }
+
+  client.stop();
+  free(tmp);
+
+  Serial.printf("Body read complete: got=%u expected=%ld\n", (unsigned)got, contentLen);
+
+  heapCheck("post-body");
+  printTaskStats("post-body");
+
+  *out_buf = buf;
+  *out_len = got;
+  return true;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(3000);
+  Serial.println(__FILE__);
+  delay(2000);
+
+  Serial.println("\nBooting...");
+  printHeapStats("boot");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("Connecting WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(250);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.print("WiFi connected: ");
+  Serial.println(WiFi.localIP());
+
+  // Critical for avoiding mid-transfer stalls
+  WiFi.setSleep(false);
+
+  delay(1000);
+  syncTime();
+  printHeapStats("after ntp");
+
+  UBaseType_t hw = uxTaskGetStackHighWaterMark(NULL);
+  Serial.printf("[loop entry] stack high watermark (words)=%u (~%u bytes)\n",
+                (unsigned)hw, (unsigned)hw * 4);
+  delay(10);
+}
+
+void loop() {
+
+
+  Serial.println("\nFetching feed...");
+
+  printHeapStats("pre-fetch");
+
+  uint8_t* raw = nullptr;
+  size_t rawLen = 0;
+
+  if (!httpsGetBodyInternal(&raw, &rawLen)) {
+    Serial.println("❌ Failed to fetch body");
+    delay(POLL_MS);
+    return;
+  }
+
+  printHeapStats("post-fetch");
+
+  // ===== DECODE BASELINE (this is the part that previously reset/crashed) =====
+  // NOTE: feed is on the stack here on purpose (baseline). It may WDT/reset.
+  transit_realtime_FeedMessage feed = transit_realtime_FeedMessage_init_zero;
+  Serial.printf("sizeof(FeedMessage) = %u bytes\n", (unsigned)sizeof(transit_realtime_FeedMessage));
+
+  pb_istream_t istream = pb_istream_from_buffer(raw, rawLen);
+/*
+  uint32_t t0 = millis();
+  bool ok = pb_decode(&istream, transit_realtime_FeedMessage_fields, &feed); 
+  uint32_t tDecode = millis() - t0; 
+
+  free(raw);
+
+  Serial.printf("pb_decode ms=%u\n", (unsigned)tDecode);
+
+  if (!ok) {
+    Serial.printf("❌ Decode failed: %s\n", PB_GET_ERROR(&istream));
+    delay(POLL_MS);
+    return;
+  }
+
+  Serial.printf("Decoded entities: %u\n", (unsigned)feed.entity_count);
+
+  Arrival arrivals[64];
+  int nArr = 0;
+
+  for (size_t i = 0; i < feed.entity_count; i++) {
+    const transit_realtime_FeedEntity& ent = feed.entity[i];
+    if (!ent.has_trip_update) continue;
+
+    const transit_realtime_TripUpdate& tu = ent.trip_update;
+    const transit_realtime_TripDescriptor& trip = tu.trip;
+
+    if (trip.route_id[0] != '\0' && !streq(trip.route_id, TARGET_ROUTE)) continue;
+
+    for (size_t j = 0; j < tu.stop_time_update_count; j++) {
+      const transit_realtime_TripUpdate_StopTimeUpdate& stu = tu.stop_time_update[j];
+      if (!streq(stu.stop_id, TARGET_STOP)) continue;
+
+      uint32_t best = 0;
+      if (stu.has_arrival && stu.arrival.time) best = (uint32_t)stu.arrival.time;
+      else if (stu.has_departure && stu.departure.time) best = (uint32_t)stu.departure.time;
+      if (!best) continue;
+
+      if (nArr < (int)(sizeof(arrivals) / sizeof(arrivals[0]))) {
+        arrivals[nArr].t = best;
+        strncpy(arrivals[nArr].trip_id, trip.trip_id, sizeof(arrivals[nArr].trip_id) - 1);
+        arrivals[nArr].trip_id[sizeof(arrivals[nArr].trip_id) - 1] = '\0';
+        nArr++;
+      }
+    }
+  }
+
+  if (nArr > 1) qsort(arrivals, nArr, sizeof(Arrival), cmpArrival);
+
+  time_t now;
+  time(&now);
+
+  Arrival future[10];
+  int nf = 0;
+  for (int i = 0; i < nArr && nf < 10; i++) {
+    if (arrivals[i].t >= (uint32_t)now) future[nf++] = arrivals[i];
+  }
+
+  printArrivals(future, nf);
+*/ 
+  free(raw);
+
+  printHeapStats("post-decode");
+
+  delay(POLL_MS);
+}
