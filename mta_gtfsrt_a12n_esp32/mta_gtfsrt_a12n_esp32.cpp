@@ -34,8 +34,8 @@ extern "C" {
 }
 
 // ---------------- USER CONFIG ----------------
-static const char* WIFI_SSID = "Gardsnas-II";
-static const char* WIFI_PASS = "cloudest-COMPLY-primer";
+static const char* WIFI_SSID = "XXXXXXXX";
+static const char* WIFI_PASS = "XXXXXXXXX";
 
 static const char* MTA_API_KEY = "";  // optional
 
